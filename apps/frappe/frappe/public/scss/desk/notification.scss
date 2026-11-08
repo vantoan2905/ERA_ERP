@@ -1,0 +1,359 @@
+@mixin size($w, $h) {
+	width: $w;
+	height: $h;
+}
+
+$notification-avatar-size: 36px;
+$notification-dot-size: 8px;
+
+.navbar {
+	perspective: 3200px;
+}
+
+.collapse-indicator {
+	padding: 0px 5px;
+	color: #d1d8dd;
+}
+
+.open-doc-count {
+	margin-left: 150px;
+}
+
+.notifications-unseen {
+	display: none;
+}
+
+// The unread count is the only unread affordance a bell gets. Bells show it as a ghost badge
+// (`.es-badge[data-variant="ghost"]`) next to the icon; the icon-only bell in desktop.html has
+// no room for a number, so there the same element is drawn as a dot on the icon's corner.
+.desktop-notification-icon {
+	position: relative;
+	@include size(28px, 28px);
+	@include flex(flex, center, center, row);
+
+	// a ghost badge sits beside the bell with its number, so the box grows to fit it
+	&:has(.notification-count.es-badge:not(.hidden)) {
+		width: auto;
+		gap: var(--spacing);
+	}
+
+	.notification-count:not(.es-badge) {
+		position: absolute;
+		top: 4px;
+		right: 4px;
+		width: 8px;
+		height: 8px;
+		padding: 0;
+		border-radius: 50%;
+		border: 1px solid var(--bg-color);
+		background-color: var(--ink-gray-9);
+		// dot only — hide the count text the shared notifications view sets on it
+		font-size: 0;
+		color: transparent;
+		overflow: hidden;
+	}
+}
+
+.mark-read {
+	display: none;
+	margin-left: 10px;
+	font-size: 11px;
+}
+
+.mark-read:hover {
+	text-decoration: underline;
+}
+
+// The tab bodies, in either host. The surface around them is the host's: .sidebar-panel
+// in the sidebar, .es-popover on the desk.
+.notification-list-body {
+	padding: 0px 10px 10px 10px;
+
+	.panel-events,
+	.panel-notifications {
+		@include size(100%, null);
+	}
+}
+
+// Desk host: .es-popover brings the surface itself (rounded-lg /
+// bg-surface-elevation-2 / shadow-2xl), so nothing is copied here. The component
+// defaults to a narrow, padded, self-scrolling panel; this one is wider, unpadded,
+// and scrolls in its body so the heading stays put.
+.es-popover.notifications-popover {
+	width: min(360px, calc(100vw - 16px));
+	padding: 0;
+	overflow: hidden;
+
+	.notifications-list {
+		@include flex(flex, null, null, column);
+		height: min(500px, calc(100vh - var(--navbar-height) - 32px));
+
+		.notification-list-body {
+			flex: 1;
+			min-height: 0;
+			overflow-y: auto;
+		}
+	}
+}
+
+.date-range {
+	padding: 10px 0 2px 10px;
+	font-weight: 500;
+}
+
+.recent-item {
+	padding: 10px;
+	margin: 2px 0px;
+	border-radius: var(--radius-md, 8px);
+	white-space: normal;
+	display: flex;
+	@include get_textstyle("base", "regular");
+	line-height: 20px;
+	color: var(--ink-gray-7);
+
+	&:not(.no-hover):hover {
+		color: var(--ink-gray-8);
+		text-decoration: none;
+		background-color: var(--surface-gray-1);
+	}
+}
+
+.recent-item.notification-item {
+	padding: 10px 8px;
+	margin: 2px 0px;
+	gap: 8px;
+
+	&::before {
+		content: "";
+		flex-shrink: 0;
+		align-self: flex-start;
+		margin-top: ($notification-avatar-size - $notification-dot-size) * 0.5;
+		@include size($notification-dot-size, $notification-dot-size);
+		border-radius: var(--radius-full);
+	}
+
+	&.unread {
+		// reads off the same ink the bell's unread dot uses
+		&::before {
+			background: var(--ink-gray-9);
+		}
+
+		.message {
+			@include get_textstyle("base", "medium");
+			color: var(--ink-gray-8);
+		}
+	}
+
+	.notification-body {
+		display: flex;
+		flex: 1;
+		min-width: 0;
+		gap: 10px;
+
+		.message {
+			max-width: 360px;
+		}
+	}
+
+	b {
+		font-weight: var(--font-weight-medium);
+		color: var(--ink-gray-8);
+	}
+
+	.notification-timestamp {
+		margin-top: 2px;
+		@include get_textstyle("xs", "regular");
+		color: var(--ink-gray-5);
+	}
+
+	.user-avatar {
+		margin-right: 10px;
+
+		.avatar-frame {
+			@include size($notification-avatar-size, $notification-avatar-size);
+		}
+	}
+}
+
+.event-group {
+	.event-group-header {
+		@include flex(flex, null, center, row);
+		gap: 6px;
+		padding: 8px 4px;
+		color: var(--ink-gray-7);
+		cursor: pointer;
+		user-select: none;
+
+		.event-group-chevron {
+			@include size(16px, 16px);
+			margin: 0;
+			color: var(--ink-gray-5);
+			transition: transform 0.15s ease;
+		}
+
+		.event-group-label {
+			@include get_textstyle("base", "regular");
+		}
+
+		.event-group-count {
+			@include get_textstyle("base", "regular");
+			margin-left: 6px;
+			color: var(--ink-gray-5);
+		}
+	}
+
+	&.collapsed {
+		.event-group-chevron {
+			transform: rotate(-90deg);
+		}
+
+		.event-group-items {
+			display: none;
+		}
+	}
+}
+
+.recent-item.event {
+	gap: 10px;
+	align-items: flex-start;
+
+	.event-date {
+		flex-shrink: 0;
+		@include size(44px, 44px);
+		@include flex(flex, center, center, column);
+		border: 1px solid var(--outline-gray-1);
+		border-radius: var(--radius-md);
+		background-color: var(--bg-color);
+		line-height: 1.1;
+
+		.event-date-month {
+			@include get_textstyle("xs", "medium");
+			text-transform: uppercase;
+			color: var(--ink-red-6);
+		}
+
+		.event-date-day {
+			@include get_textstyle("lg", "medium");
+			color: var(--ink-gray-8);
+		}
+	}
+
+	.event-item {
+		min-width: 0;
+
+		.event-subject-row {
+			@include flex(flex, null, center, row);
+			gap: 8px;
+		}
+
+		.event-dot {
+			flex-shrink: 0;
+			@include size(8px, 8px);
+			border-radius: var(--radius-full);
+			background-color: var(--ink-green-6);
+		}
+
+		.event-subject {
+			@include get_textstyle("base", "medium");
+			color: var(--ink-gray-8);
+			@include truncate;
+		}
+
+		.event-time {
+			@include get_textstyle("base", "regular");
+			color: var(--ink-gray-6);
+		}
+
+		.avatar-group {
+			margin-top: 10px;
+		}
+	}
+
+	&:hover {
+		.avatar-frame {
+			border-color: var(--border-color);
+		}
+	}
+}
+
+.targets-container {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+
+	.recent-item.target-company {
+		display: block;
+		text-align: center;
+
+		svg {
+			max-width: 100px;
+			margin: auto;
+		}
+
+		.target-title {
+			margin: auto;
+			@include get_textstyle("base", "regular");
+			color: var(--text-light);
+		}
+
+		.target-progress {
+			max-width: 150px;
+			margin: 10px auto auto auto;
+
+			.progress,
+			.progress-bar {
+				height: 8px;
+			}
+		}
+
+		&:first-child {
+			grid-column-start: 1;
+			grid-column-end: 3;
+
+			svg {
+				max-width: 200px;
+				margin: auto;
+			}
+
+			.target-progress {
+				max-width: 200px;
+				margin: 10px auto auto auto;
+
+				.progress,
+				.progress-bar {
+					height: 8px;
+				}
+			}
+		}
+	}
+}
+
+.list-footer {
+	display: block;
+	text-align: center;
+	margin-top: 4px;
+	padding: 10px;
+	border-radius: var(--radius-md);
+	@include get_textstyle("base", "regular");
+	color: var(--ink-gray-5);
+
+	&:hover {
+		text-decoration: none;
+		color: var(--ink-gray-8);
+		background-color: var(--surface-gray-1);
+	}
+}
+
+.notifications-loading {
+	margin-bottom: 15px;
+}
+
+@include media-breakpoint-down(sm) {
+	.sidebar-panel-notifications .recent-item .user-avatar {
+		margin-right: 10px;
+		margin-left: 5px;
+	}
+
+	.es-popover.notifications-popover {
+		width: calc(100vw - 16px);
+	}
+}

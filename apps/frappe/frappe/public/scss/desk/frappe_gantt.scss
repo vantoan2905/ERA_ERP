@@ -1,0 +1,43 @@
+.gantt .grid-column:hover {
+	cursor: copy;
+}
+
+.layout-main-section-wrapper:not(.disable-scrolling)
+	.frappe-list
+	.result-container
+	.result:has(> .gantt-container) {
+	display: block;
+
+	.gantt-container {
+		max-height: 100%;
+	}
+}
+
+.gantt-container .popup-wrapper {
+	min-width: 9rem;
+	border-radius: var(--radius);
+	@include get_textstyle("sm", "regular");
+
+	.title {
+		color: white;
+		border-bottom: none;
+		padding-bottom: 0;
+	}
+
+	.subtitle {
+		color: var(--gray-500);
+	}
+
+	.pointer {
+		height: 15px;
+	}
+}
+
+.gantt-modern {
+	height: calc(100vh - 240px);
+	overflow-y: auto;
+
+	.gantt-container {
+		position: relative;
+	}
+}

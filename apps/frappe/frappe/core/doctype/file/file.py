@@ -1,0 +1,1244 @@
+# Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
+# License: MIT. See LICENSE
+"""Storage-agnostic ``File`` base class.
+
+Byte handling lives in ``FileV1`` (legacy disk layout) or ``FileV2`` (``frappe.storage``);
+``File.resolve_controller`` picks one per site from the ``storage_v2`` flag."""
+
+import copyreg
+import io
+import mimetypes
+import os
+import posixpath
+import re
+import zipfile
+from typing import TYPE_CHECKING
+from urllib.parse import quote, unquote
+
+import filetype
+
+import frappe
+from frappe import _
+from frappe.database.schema import SPECIAL_CHAR_PATTERN
+from frappe.exceptions import DoesNotExistError
+from frappe.model.db_query import requires_owner_constraint
+from frappe.model.document import Document
+from frappe.permissions import SYSTEM_USER_ROLE, get_doctypes_with_read, get_role_permissions
+from frappe.utils import (
+	cint,
+	get_link_to_form,
+	get_table_name,
+	get_url,
+)
+from frappe.utils.html_utils import escape_html
+
+from .exceptions import (
+	AttachmentLimitReached,
+	FileTypeNotAllowed,
+	FolderNotEmpty,
+	MaxFileSizeReachedError,
+)
+from .utils import *
+
+if TYPE_CHECKING:
+	from PIL.ImageFile import ImageFile
+
+exclude_from_linked_with = True
+
+URL_PREFIXES = ("http://", "https://", "/api/method/")
+FILE_ENCODING_OPTIONS = ("utf-8-sig", "utf-8", "windows-1250", "windows-1252")
+# OLE2 Compound File Binary signature, used by legacy .xls/.doc/.ppt files, which filetype fails to detect
+OLE_FILE_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+class _ResolvedFileMeta(type(Document)):
+	"""Metaclass of the spliced classes built by ``File.resolve_controller``.
+
+	A spliced class has no importable home; ``copyreg`` pickles it as "this site's File class"."""
+
+
+def _restore_resolved_file_class(doctype):
+	from frappe.model.document import get_controller
+
+	return get_controller(doctype)
+
+
+copyreg.pickle(_ResolvedFileMeta, lambda cls: (_restore_resolved_file_class, (cls._DOCTYPE_NAME,)))
+
+
+class File(Document):
+	_DOCTYPE_NAME = "File"
+
+	# begin: auto-generated types
+	# This code is auto-generated. Do not modify anything in this block.
+
+	from typing import TYPE_CHECKING
+
+	if TYPE_CHECKING:
+		from frappe.types import DF
+
+		attached_to_doctype: DF.Link | None
+		attached_to_field: DF.Data | None
+		attached_to_name: DF.Data | None
+		blob: DF.Link | None
+		content_hash: DF.Data | None
+		file_name: DF.Data | None
+		file_size: DF.Int
+		file_type: DF.Data | None
+		file_url: DF.Code | None
+		folder: DF.Link | None
+		is_attachments_folder: DF.Check
+		is_folder: DF.Check
+		is_home_folder: DF.Check
+		is_private: DF.Check
+		old_parent: DF.Data | None
+		thumbnail_url: DF.SmallText | None
+		uploaded_to_dropbox: DF.Check
+		uploaded_to_google_drive: DF.Check
+	# end: auto-generated types
+
+	no_feed_on_delete = True
+
+	@classmethod
+	def resolve_controller(cls) -> type["File"]:
+		"""Pick the storage implementation for this site. ``get_controller`` caches the result.
+
+		An ``override_doctype_class`` override stays on top: its MRO is override -> storage -> File."""
+		import frappe.storage
+
+		from .file_v1 import FileV1
+		from .file_v2 import FileV2
+
+		if issubclass(cls, FileV1 | FileV2):
+			return cls
+
+		concrete = FileV2 if frappe.storage.enabled() else FileV1
+		if cls is File:
+			return concrete
+
+		return _ResolvedFileMeta(cls.__name__, (cls, concrete), {"__module__": cls.__module__})
+
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		# if content is set, file_url will be generated
+		# decode comes in the picture if content passed has to be decoded before writing to disk
+
+		self.content = self.get("content") or b""
+		self.decode = self.get("decode", False)
+
+	@property
+	def is_remote_file(self):
+		if self.file_url:
+			return self.file_url.startswith(URL_PREFIXES)
+		return not self.content
+
+	def autoname(self):
+		"""Set name for folder"""
+		if self.is_folder:
+			if self.folder:
+				self.name = self.get_name_based_on_parent_folder()
+			else:
+				# home
+				self.name = self.file_name
+		else:
+			self.name = frappe.generate_hash(length=10)
+
+	def before_insert(self):
+		if self.attached_to_doctype and not self.attached_to_name:
+			self.attached_to_doctype = None
+			self.attached_to_field = None
+		# Ensure correct formatting and type
+		self.file_url = unquote(self.file_url) if self.file_url else ""
+		self.normalize_file_url()
+
+		self.set_folder_name()
+		self.set_is_private()
+		self.set_file_name()
+		self.validate_attachment_limit()
+		self.set_file_type()
+		self.validate_file_extension()
+		self.validate_private_file_access()
+		# before ingestion, which may read the linked blob's bytes
+		self.validate_blob_reference()
+
+		if self.is_folder:
+			if self.file_url:
+				frappe.throw(_("A folder cannot have a File URL"))
+			return
+
+		if self.flags.copy_from_existing_file:
+			# Preserve the normal insert lifecycle for hooks and validations, but skip
+			# reprocessing an existing blob that is already referenced by `file_url`.
+			if not self.file_url:
+				frappe.throw(
+					_("File URL is required when copying an existing attachment."),
+					exc=frappe.MandatoryError,
+				)
+			return
+
+		self._ingest_new_content()
+
+	def after_insert(self):
+		if not self.is_folder:
+			self.create_attachment_record()
+
+	def create_attachment_copy(
+		self,
+		attached_to_doctype: str,
+		attached_to_name: str,
+		attached_to_field: str | None = None,
+		ignore_permissions: bool = False,
+	):
+		"""Efficiently copy an attachment from one document to another by reusing `file_url`."""
+		if self.is_folder:
+			frappe.throw(_("Cannot attach a folder to a document"))
+
+		attachment = frappe.copy_doc(self)
+		attachment.update(
+			{
+				"attached_to_doctype": attached_to_doctype,
+				"attached_to_name": attached_to_name,
+				"attached_to_field": attached_to_field,
+			}
+		)
+		attachment.folder = None
+		attachment.flags.copy_from_existing_file = True
+		return attachment.insert(ignore_permissions=ignore_permissions)
+
+	def validate(self):
+		if self.is_folder:
+			if self.file_url:
+				frappe.throw(_("A folder cannot have a File URL"))
+			return
+
+		if self.is_remote_file:
+			self.content_hash = None
+
+		self.validate_attachment_references()
+		self.enforce_public_file_restrictions()
+
+		# must run before handle_is_private_changed, which legitimately rewrites file_url
+		if not self.is_new() and self.has_value_changed("file_url"):
+			self.file_url = unquote(self.file_url) if self.file_url else ""
+			self.normalize_file_url()
+			self.validate_private_file_access()
+
+		# when dict is passed to get_doc for creation of new_doc, is_new returns None
+		# this case is handled inside handle_is_private_changed
+		if not self.is_new() and self.has_value_changed("is_private"):
+			self.handle_is_private_changed()
+
+		self.validate_file_path()
+		self.validate_file_url()
+		self.validate_file_on_disk()
+		self.file_size = frappe.form_dict.file_size or self.file_size
+
+	def validate_attachment_references(self):
+		if not self.attached_to_doctype:
+			return
+
+		if not self.attached_to_name or not isinstance(self.attached_to_name, str | int):
+			frappe.throw(
+				_("Attached To Name must be a string or an integer"),
+				frappe.ValidationError,
+			)
+
+		if self.attached_to_field and SPECIAL_CHAR_PATTERN.search(self.attached_to_field):
+			frappe.throw(_("The fieldname you've specified in Attached To Field is invalid"))
+
+		if self.flags.ignore_permissions or frappe.flags.in_install:
+			return
+
+		from frappe.handler import check_write_permission
+
+		check_write_permission(self.attached_to_doctype, self.attached_to_name)
+
+	def enforce_public_file_restrictions(self):
+		if not self.is_private and frappe.get_system_settings(
+			"only_allow_system_managers_to_upload_public_files"
+		):
+			try:
+				frappe.only_for("System Manager")
+			except PermissionError:
+				frappe.throw(_("Only System Managers can make this file public."))
+
+	def normalize_file_url(self):
+		"""Collapse `.` and `//` segments in a local file URL; reject `..`.
+
+		The private-file access check matches `file_url` literally, but the path is
+		resolved on disk after normalization. Without this, `/private/files/./secret.pdf`
+		slips past the check as a new URL while still reading `secret.pdf` from disk.
+		Pinning every row to the canonical URL keeps the two views in step.
+		"""
+		if not self.file_url:
+			return
+
+		site_url = self.get_site_url_prefix()
+		url = self.file_url[len(site_url) :]
+		if not site_url and self.is_remote_file:
+			return
+
+		if ".." in url.split("/"):
+			frappe.throw(_("The File URL you've entered is incorrect"), title=_("Invalid File URL"))
+
+		for prefix in ("/private/files/", "/files/"):
+			if not url.startswith(prefix):
+				continue
+			name = posixpath.normpath("/" + url[len(prefix) :].lstrip("/")).lstrip("/")
+			if not name or name == ".":
+				frappe.throw(_("The File URL you've entered is incorrect"), title=_("Invalid File URL"))
+			self.file_url = site_url + prefix + name
+			return
+
+	def get_site_url_prefix(self) -> str:
+		"""This site's URL if file_url starts with it (it is stripped later), else an empty string."""
+		site_url = get_url()
+		return site_url if self.file_url.startswith(site_url + "/") else ""
+
+	def validate_private_file_access(self):
+		"""Validate that the user has permission to access an existing private file."""
+		if not self.file_url:
+			return
+
+		filters = {"file_url": self.file_url[len(self.get_site_url_prefix()) :], "is_private": 1}
+		if not self.is_new():
+			filters["name"] = ["!=", self.name]
+
+		private_files = frappe.get_all("File", filters=filters, fields=["name", "owner"])
+		if not private_files:
+			return
+
+		user = frappe.session.user
+		if user == "Administrator":
+			return
+
+		# a file can be attached to multiple documents; access to any one of them is enough
+		for private_file in private_files:
+			if user == private_file.owner:
+				return
+
+			if has_permission(frappe.get_doc("File", private_file.name), "read", user=user):
+				return
+
+		frappe.throw(
+			_("You do not have permission to access this file"),
+			frappe.PermissionError,
+		)
+
+	def before_save(self):
+		# here, not in validate(): a File subclass may skip super().validate()
+		if not self.is_new():
+			self.validate_blob_reference()
+		self.revive_linked_blob()
+
+	def validate_blob_reference(self):
+		"""Reject a ``blob`` link this row cannot hold.
+
+		Runs before anything reads the linked blob's bytes: ingestion on
+		insert, and the privacy flip in ``before_save``."""
+		if not self.get("blob"):
+			return
+		if self.file_url and self.file_url.startswith(URL_PREFIXES):
+			frappe.throw(_("A remote file cannot link a stored blob"))
+		if self.is_new() or self.has_value_changed("blob"):
+			self.validate_blob_access()
+
+	def revive_linked_blob(self):
+		"""Lock a newly linked existing blob so GC keeps it until this row commits.
+
+		Runs after ingestion, which may link an existing blob (dedup, a copied
+		row). A blob ``put_blob`` returned is already new or revived."""
+		if not self.get("blob") or self.blob == self.flags.stored_blob:
+			return
+		if not (self.is_new() or self.has_value_changed("blob")):
+			return
+
+		from frappe.storage.blob import revive_blob
+
+		if not revive_blob(self.blob):
+			frappe.throw(_("File Blob {0} no longer exists").format(self.blob), DoesNotExistError)
+
+	def validate_blob_access(self):
+		"""Reject repointing ``blob`` at a private blob the user cannot already download.
+
+		The ``/private/files/<blob>/`` route grants a blob to anyone who can
+		read any File row linked to it, so the link is checked like
+		``file_url`` is. A blob the controller just wrote is trusted."""
+		if not self.blob or self.blob == self.flags.stored_blob or self.flags.ignore_permissions:
+			return
+
+		from frappe.storage.serve import has_file_permission
+
+		if cint(frappe.db.get_value("File Blob", self.blob, "is_private")) and not has_file_permission(
+			self.blob
+		):
+			frappe.throw(_("You do not have permission to access this file"), frappe.PermissionError)
+
+	def after_rename(self, *args, **kwargs):
+		for successor in self.get_successors():
+			setup_folder_path(successor, self.name)
+
+	def on_trash(self):
+		if self.is_home_folder or self.is_attachments_folder:
+			frappe.throw(_("Cannot delete Home and Attachments folders"))
+		self.validate_empty_folder()
+		self.validate_protected_file()
+		self.validate_not_referenced_in_attach_field()
+		frappe.db.after_commit.add(self._delete_file_on_disk)
+		if not self.is_folder:
+			fieldname = escape_html(self.attached_to_field or "")
+			file_name = escape_html(self.file_name)
+			self.add_comment_in_reference_doc(
+				"Attachment Removed",
+				f"<span data-fieldname='{fieldname}'>{file_name}</span>",
+			)
+
+	def get_name_based_on_parent_folder(self) -> str | None:
+		if self.folder:
+			return os.path.join(self.folder, self.file_name)
+
+	def get_successors(self):
+		return frappe.get_all("File", filters={"folder": self.name}, pluck="name")
+
+	def update_attached_to_field(self, old_file_url):
+		if (
+			not self.attached_to_doctype
+			or not self.attached_to_name
+			or not self.fetch_attached_to_field(old_file_url)
+		):
+			return
+
+		parent_meta = frappe.get_meta(self.attached_to_doctype)
+
+		if parent_meta.issingle:
+			if (
+				parent_meta.has_field(self.attached_to_field)
+				and frappe.db.get_single_value(self.attached_to_doctype, self.attached_to_field)
+				== old_file_url
+			):
+				frappe.db.set_single_value(
+					self.attached_to_doctype,
+					self.attached_to_field,
+					self.file_url,
+				)
+		elif parent_meta.has_field(self.attached_to_field) and frappe.db.exists(
+			self.attached_to_doctype,
+			{"name": self.attached_to_name, self.attached_to_field: old_file_url},
+		):
+			frappe.db.set_value(
+				self.attached_to_doctype,
+				self.attached_to_name,
+				self.attached_to_field,
+				self.file_url,
+			)
+
+		for table_df in parent_meta.get_table_fields():
+			child_meta = frappe.get_meta(table_df.options)
+			if not child_meta.has_field(self.attached_to_field):
+				continue
+
+			match_filters = {
+				"parent": self.attached_to_name,
+				"parentfield": table_df.fieldname,
+				self.attached_to_field: old_file_url,
+			}
+			matching_rows = frappe.get_all(table_df.options, filters=match_filters, pluck="name")
+			if not matching_rows:
+				continue
+			if len(matching_rows) > 1:
+				continue
+
+			frappe.db.set_value(table_df.options, matching_rows[0], self.attached_to_field, self.file_url)
+
+	def fetch_attached_to_field(self, old_file_url):
+		if self.attached_to_field:
+			return True
+
+		reference_dict = frappe.get_doc(self.attached_to_doctype, self.attached_to_name).as_dict()
+
+		for key, value in reference_dict.items():
+			if value == old_file_url:
+				self.attached_to_field = key
+				return True
+
+	def validate_attachment_limit(self):
+		attachment_limit = 0
+		if self.attached_to_doctype and self.attached_to_name:
+			attachment_limit = cint(frappe.get_meta(self.attached_to_doctype).max_attachments)
+
+		if attachment_limit:
+			current_attachment_count = len(
+				frappe.get_all(
+					"File",
+					filters={
+						"attached_to_doctype": self.attached_to_doctype,
+						"attached_to_name": self.attached_to_name,
+					},
+					limit=attachment_limit + 1,
+				)
+			)
+
+			if current_attachment_count >= attachment_limit:
+				frappe.throw(
+					_("Maximum Attachment Limit of {0} has been reached for {1} {2}.").format(
+						frappe.bold(attachment_limit),
+						self.attached_to_doctype,
+						self.attached_to_name,
+					),
+					exc=AttachmentLimitReached,
+					title=_("Attachment Limit Reached"),
+				)
+
+	def validate_remote_file(self):
+		"""Validates if file uploaded using URL already exist"""
+		site_url = get_url()
+		if self.file_url and "/files/" in self.file_url and self.file_url.startswith(site_url):
+			self.file_url = self.file_url.split(site_url, 1)[1]
+
+	def set_folder_name(self):
+		"""Make parent folders if not exists based on reference doctype and name"""
+		if self.folder:
+			return
+
+		if self.attached_to_doctype:
+			self.folder = frappe.db.get_value("File", {"is_attachments_folder": 1})
+
+		elif not self.is_home_folder:
+			self.folder = "Home"
+
+	def set_file_type(self):
+		if self.is_folder:
+			return
+
+		file_type = mimetypes.guess_type(self.file_name)[0]
+		if not file_type:
+			return
+
+		file_extension = mimetypes.guess_extension(file_type)
+		self.file_type = file_extension.lstrip(".").upper() if file_extension else None
+
+	def validate_file_extension(self):
+		# Only validate uploaded files, not generated by code/integrations.
+		if self.is_folder or not frappe.request:
+			return
+
+		allowed_extensions = frappe.get_system_settings("allowed_file_extensions")
+		if not allowed_extensions:
+			return
+
+		file_extension = os.path.splitext(self.file_name)[1].lstrip(".").upper()
+		if file_extension not in allowed_extensions.splitlines():
+			frappe.throw(
+				_("File type of {0} is not allowed").format(file_extension),
+				exc=FileTypeNotAllowed,
+			)
+
+	def check_content(self):
+		from frappe.utils.pdf import pdf_contains_js
+
+		if self.file_type == "PDF" and self._content and pdf_contains_js(self._content):
+			frappe.throw(_("This PDF cannot be uploaded as it contains unsafe content."))
+
+	def set_file_name(self):
+		if not self.file_name and not self.file_url:
+			frappe.throw(
+				_("Fields `file_name` or `file_url` must be set for File"),
+				exc=frappe.MandatoryError,
+			)
+		elif not self.file_name and self.file_url:
+			self.file_name = self.file_url.split("/")[-1].split("?")[0]
+		else:
+			self.file_name = re.sub(r"/", "", self.file_name)
+
+	def make_thumbnail(
+		self,
+		set_as_thumbnail: bool = True,
+		width: int = 300,
+		height: int = 300,
+		suffix: str = "small",
+		crop: bool = False,
+	) -> str:
+		from requests.exceptions import HTTPError, SSLError
+
+		from frappe.utils.image import Image, ImageOps
+
+		if not self.file_url:
+			return
+
+		try:
+			if self.get("blob"):
+				image, filename, extn = self.get_stored_image()
+			elif self.file_url.startswith(("/files", "/private/files")):
+				image, filename, extn = get_local_image(self.file_url)
+			else:
+				image, filename, extn = get_web_image(self.file_url)
+		except (HTTPError, SSLError, OSError, TypeError):
+			return
+
+		size = width, height
+		if crop:
+			image = ImageOps.fit(image, size, Image.Resampling.LANCZOS)
+		else:
+			image.thumbnail(size, Image.Resampling.LANCZOS)
+
+		thumbnail_url = f"{filename}_{suffix}.{extn}"
+		path = os.path.abspath(frappe.get_site_path("public", thumbnail_url.lstrip("/")))
+
+		try:
+			if self.get("blob") and not self.is_private:
+				# a blob on another driver has no folder on this disk yet
+				os.makedirs(os.path.dirname(path), exist_ok=True)
+			image.save(path)
+			if set_as_thumbnail:
+				self.db_set("thumbnail_url", thumbnail_url)
+
+		except OSError:
+			frappe.msgprint(_("Unable to write file format for {0}").format(path))
+			return
+
+		return thumbnail_url
+
+	def get_stored_image(self) -> tuple["ImageFile", str, str]:
+		"""Open a blob-backed image through its storage driver, like ``get_local_image``."""
+		from frappe.utils.image import Image
+
+		content = self._read_content()
+		image = Image.open(io.BytesIO(content))
+		filename, dot, extn = self.file_url.rpartition(".")
+		if not dot:
+			filename, extn = self.file_url, None
+		return image, filename, get_extension(filename, extn, content)
+
+	def validate_empty_folder(self):
+		"""Throw exception if folder is not empty"""
+		if self.is_folder and frappe.get_all("File", filters={"folder": self.name}, limit=1):
+			frappe.throw(_("Folder {0} is not empty").format(self.name), FolderNotEmpty)
+
+	def validate_protected_file(self):
+		"""Throw an exception if this file is attached to a doctype that protects files.
+
+		Allows deleting the attached file if the linked document is in draft. If submitted,
+		deletion is not allowed. If canceled, requires delete permissions on the linked document.
+		"""
+		if not (self.attached_to_doctype and self.attached_to_name):
+			return
+
+		try:
+			ref_doc = frappe.get_doc(self.attached_to_doctype, self.attached_to_name)
+		except DoesNotExistError:
+			return
+
+		if ref_doc.docstatus == 0:
+			# If the document is not submitted yet, users can correct wrong attachments
+			return
+
+		if not ref_doc.meta.protect_attached_files:
+			return
+
+		if ref_doc.docstatus == 2 and ref_doc.has_permission("delete"):
+			# Deletion must still be possible if users have the permission to delete the linked document
+			return
+
+		frappe.throw(
+			msg=_("This file is attached to a protected document and cannot be deleted."),
+			title=_("Protected File"),
+		)
+
+	def validate_not_referenced_in_attach_field(self):
+		"""Throw an exception if the linked document still has this file's URL set in an Attach field."""
+		if self.flags.force_delete:
+			return
+
+		if not (self.attached_to_doctype and self.attached_to_name and self.file_url):
+			return
+
+		url_backed_by_another_file = frappe.get_all(
+			"File",
+			filters={"file_url": self.file_url, "name": ["!=", self.name]},
+			limit=1,
+		)
+		if url_backed_by_another_file:
+			return
+
+		try:
+			ref_doc = frappe.get_doc(self.attached_to_doctype, self.attached_to_name)
+		except DoesNotExistError:
+			return
+
+		def get_referencing_field(doc):
+			for df in doc.meta.get("fields", {"fieldtype": ["in", ["Attach", "Attach Image"]]}):
+				if doc.get(df.fieldname) == self.file_url:
+					return df
+
+		docs_to_check = [ref_doc]
+		for table_field in ref_doc.meta.get_table_fields():
+			docs_to_check.extend(ref_doc.get(table_field.fieldname))
+
+		referencing_field = None
+		referencing_doc = None
+		for doc in docs_to_check:
+			if referencing_field := get_referencing_field(doc):
+				referencing_doc = doc
+				break
+
+		if not referencing_field:
+			return
+
+		if ref_doc.docstatus > 0 and not referencing_field.allow_on_submit:
+			return
+
+		field_label = frappe.bold(_(referencing_field.label or referencing_field.fieldname))
+
+		if referencing_doc is ref_doc:
+			msg = _(
+				"This file cannot be deleted as it is set in field {0} of {1} {2}. Clear the field first."
+			).format(field_label, _(ref_doc.doctype), get_link_to_form(ref_doc.doctype, ref_doc.name))
+		else:
+			msg = _(
+				"This file cannot be deleted as it is set in field {0} in row {1} of {2} {3}. Clear the field first."
+			).format(
+				field_label,
+				referencing_doc.idx,
+				_(ref_doc.doctype),
+				get_link_to_form(ref_doc.doctype, ref_doc.name),
+			)
+
+		frappe.throw(msg, frappe.LinkExistsError)
+
+	def unzip(self) -> list["File"]:
+		"""Unzip current file and replace it by its children"""
+		from frappe.core.api.file import get_max_extract_size
+
+		if not self.file_url.endswith(".zip"):
+			frappe.throw(_("{0} is not a zip file").format(self.file_name))
+
+		self.check_permission("read")
+
+		from frappe.storage.blob import spool_to_tempfile
+
+		max_extracted_size = get_max_extract_size()
+
+		files = []
+		total_extracted_size = 0
+		# spooled because a driver stream (e.g. S3) is not seekable, which zipfile needs
+		with self._open_stored_bytes() as stream:
+			spool, _size = spool_to_tempfile(stream)
+		with spool, zipfile.ZipFile(spool) as z:
+			# skip directories, macos hidden directory & hidden files
+			members = [
+				file
+				for file in z.filelist
+				if not (file.is_dir() or file.filename.startswith("__MACOSX/"))
+				and not os.path.basename(file.filename).startswith(".")
+			]
+
+			# Reject on declared (central directory) sizes before reading any member,
+			# so a small, highly compressible archive can't force large reads/writes.
+			declared_total_size = sum(file.file_size for file in members)
+			if declared_total_size > max_extracted_size:
+				frappe.throw(
+					_("Zip file extracts to more than the maximum allowed size of {0} MB").format(
+						max_extracted_size // 1048576
+					)
+				)
+
+			try:
+				for file in members:
+					filename = os.path.basename(file.filename)
+
+					file_doc = frappe.new_doc("File")
+					try:
+						content = z.read(file.filename)
+					except zipfile.BadZipFile:
+						frappe.throw(_("{0} is a not a valid zip file").format(self.file_name))
+
+					total_extracted_size += len(content)
+					if total_extracted_size > max_extracted_size:
+						frappe.throw(
+							_("Zip file extracts to more than the maximum allowed size of {0} MB").format(
+								max_extracted_size // 1048576
+							)
+						)
+
+					file_doc.content = content
+					file_doc.file_name = filename
+					file_doc.folder = self.folder
+					file_doc.is_private = self.is_private
+					file_doc.attached_to_doctype = self.attached_to_doctype
+					file_doc.attached_to_name = self.attached_to_name
+					file_doc.save()
+					files.append(file_doc)
+			except Exception:
+				# roll back any children already persisted before the failure
+				for file_doc in files:
+					frappe.delete_doc("File", file_doc.name, ignore_permissions=True, force=True)
+				raise
+
+		frappe.delete_doc("File", self.name)
+		return files
+
+	def get_content(self, encodings=None) -> bytes | str:
+		if self.is_folder:
+			frappe.throw(_("Cannot get file contents of a Folder"))
+
+		self.validate_file_path()
+		# if doc was just created, content field is already populated, return it as-is
+		if self.get("content"):
+			self._content = self.content
+			if self.decode:
+				self._content = decode_file_content(self._content)
+				self.decode = False
+			# self.content = None # TODO: This needs to happen; make it happen somehow
+			return self._content
+
+		self._content = self._read_content()
+
+		if encodings is None:
+			encodings = FILE_ENCODING_OPTIONS
+		# Only decode if not a binary file
+		kind = filetype.guess(self._content)
+		if not kind and not self._content.startswith(OLE_FILE_SIGNATURE):
+			# looping will not result in slowdown, as the content is usually utf-8 or utf-8-sig
+			# encoded so the first iteration will be enough most of the time
+			for encoding in encodings:
+				try:
+					# read file with proper encoding
+					self._content = self._content.decode(encoding)
+					break
+				except UnicodeDecodeError:
+					# for .png, .jpg, etc
+					continue
+
+		return self._content
+
+	def save_file(
+		self,
+		content: bytes | str | None = None,
+		decode=False,
+		ignore_existing_file_check=False,
+		overwrite=False,
+	):
+		if self.is_remote_file:
+			return
+
+		self._stash_original_content()
+
+		if content:
+			self.content = content
+			self.decode = decode
+			self.get_content()
+
+		if not self._content:
+			return
+
+		self.is_private = cint(self.is_private)
+		self.content_type = mimetypes.guess_type(self.file_name)[0]
+
+		# transform file content based on site settings
+		if (
+			self.content_type
+			and self.content_type == "image/jpeg"
+			and frappe.get_system_settings("strip_exif_metadata_from_uploaded_images")
+		):
+			from frappe.utils.image import strip_exif_data
+
+			self._content = strip_exif_data(self._content, self.content_type)
+
+		self.file_size = self.check_max_file_size()
+		self.content_hash = get_content_hash(self._content)
+
+		return self._store_content(ignore_existing_file_check=ignore_existing_file_check, overwrite=overwrite)
+
+	def check_max_file_size(self):
+		from frappe.core.api.file import get_max_file_size
+
+		max_file_size = get_max_file_size()
+		file_size = len(self._content or b"")
+
+		if not self.flags.skip_file_size_check and file_size > max_file_size:
+			msg = _("File size exceeded the maximum allowed size of {0} MB").format(max_file_size / 1048576)
+			if frappe.has_permission("System Settings", "write"):
+				msg += ".<br>" + _("You can increase the limit from System Settings.")
+			frappe.throw(msg, exc=MaxFileSizeReachedError)
+
+		return file_size
+
+	def is_downloadable(self):
+		return has_permission(self, "read")
+
+	def get_extension(self):
+		"""Split and return filename and extension for the set `file_name`."""
+		return os.path.splitext(self.file_name)
+
+	def create_attachment_record(self):
+		icon = ' <i class="fa fa-lock text-warning"></i>' if self.is_private else ""
+		file_url = quote(frappe.safe_encode(self.file_url), safe="/:") if self.file_url else self.file_name
+		file_name = escape_html(self.file_name or self.file_url)
+		# fieldname is embedded so the timeline can drop this entry for users without permlevel
+		# access to the field, without needing a structured Comment field of its own
+		fieldname = escape_html(self.attached_to_field or "")
+
+		self.add_comment_in_reference_doc(
+			"Attachment",
+			f"<a href='{file_url}' target='_blank' data-fieldname='{fieldname}'>{file_name}</a>{icon}",
+		)
+
+	def add_comment_in_reference_doc(self, comment_type, text):
+		if self.attached_to_doctype and self.attached_to_name:
+			try:
+				doc = frappe.get_doc(self.attached_to_doctype, self.attached_to_name)
+				doc.add_comment(comment_type, text)
+			except frappe.DoesNotExistError:
+				frappe.clear_messages()
+
+	def set_is_private(self):
+		if self.is_private:
+			return
+
+		if self.file_url:
+			self.is_private = cint(self.file_url.startswith("/private"))
+
+	def validate_file_url_matches_record(self):
+		"""Ensure file_url actually resolves back to an existing File record with this name."""
+		if not self.file_url:
+			return
+
+		actual_file_url = frappe.db.get_value("File", self.name, "file_url") if self.name else None
+		if actual_file_url != self.file_url:
+			frappe.throw(_("The File URL does not belong to this File record"), frappe.PermissionError)
+
+	@frappe.whitelist()
+	def optimize_file(self):
+		if self.is_folder:
+			raise TypeError("Folders cannot be optimized")
+
+		self.validate_file_url_matches_record()
+		self.validate_blob_access()
+
+		content_type = mimetypes.guess_type(self.file_name)[0]
+		is_local_image = content_type.startswith("image/") and self.file_size > 0
+		is_svg = content_type == "image/svg+xml"
+		is_local_pdf = content_type == "application/pdf" and self.file_size > 0
+
+		if not (is_local_image or is_local_pdf):
+			raise NotImplementedError("Only local image or PDF files can be optimized")
+
+		if is_svg:
+			raise TypeError("Optimization of SVG images is not supported")
+
+		original_content = self.get_content()
+
+		if is_local_pdf:
+			from frappe.utils.pdf import optimize_pdf
+
+			optimized_content = optimize_pdf(original_content)
+		else:
+			from frappe.utils.image import optimize_image
+
+			optimized_content = optimize_image(
+				content=original_content,
+				content_type=content_type,
+			)
+
+		if original_content == optimized_content:
+			# optimization failed, don't resave it
+			return
+
+		old_file_url = self.file_url
+		self.save_file(content=optimized_content, overwrite=True)
+		self.save()
+		# storage v2 writes a new blob, so the URL changes
+		if self.file_url != old_file_url:
+			self.update_attached_to_field(old_file_url)
+
+	@property
+	def unique_url(self) -> str:
+		"""Unique URL contains file ID in URL to speed up permisison checks."""
+		from urllib.parse import urlencode
+
+		if self.is_private:
+			return self.file_url + "?" + urlencode({"fid": self.name})
+		else:
+			return self.file_url
+
+	@staticmethod
+	def zip_files(files):
+		requested, added = set(), set()
+		zip_file = io.BytesIO()
+		zf = zipfile.ZipFile(zip_file, "w", zipfile.ZIP_DEFLATED)
+		for _file in files:
+			if isinstance(_file, str):
+				if _file in requested:
+					continue
+				requested.add(_file)
+				_file = frappe.get_doc("File", _file)
+			if not isinstance(_file, File):
+				continue
+			if _file.is_folder or _file.name in added:
+				continue
+			if not has_permission(_file, "read"):
+				continue
+			added.add(_file.name)
+			zf.writestr(_file.file_name, _file.get_content())
+		zf.close()
+		return zip_file.getvalue()
+
+	# --- storage seams, implemented by FileV1 / FileV2 ---
+
+	def _ingest_new_content(self):
+		"""Store the incoming bytes (or validate the remote/blob reference) on insert."""
+		self._storage_not_resolved()
+
+	def _read_content(self) -> bytes:
+		"""Return the stored bytes."""
+		self._storage_not_resolved()
+
+	def _open_stored_bytes(self):
+		"""Return a readable binary stream of the stored bytes."""
+		self._storage_not_resolved()
+
+	def _store_content(self, ignore_existing_file_check=False, overwrite=False):
+		"""Persist ``self._content`` and set ``file_url``."""
+		self._storage_not_resolved()
+
+	def _stash_original_content(self):
+		"""Keep state needed to undo an in-place content update on rollback.
+
+		Nothing to keep by default; only legacy storage rewrites bytes in
+		place (``FileV1`` overrides this)."""
+
+	def get_full_path(self):
+		self._storage_not_resolved()
+
+	def exists_on_disk(self):
+		self._storage_not_resolved()
+
+	def validate_file_path(self):
+		self._storage_not_resolved()
+
+	def validate_file_url(self):
+		self._storage_not_resolved()
+
+	def validate_file_on_disk(self):
+		self._storage_not_resolved()
+
+	def handle_is_private_changed(self):
+		self._storage_not_resolved()
+
+	def _delete_file_on_disk(self):
+		self._storage_not_resolved()
+
+	def _storage_not_resolved(self):
+		raise NotImplementedError(
+			f"{type(self).__name__} has no storage implementation. File controllers "
+			"must be loaded through frappe.get_doc / frappe.get_controller so that "
+			"File.resolve_controller can pick FileV1 or FileV2 for the site."
+		)
+
+
+def on_doctype_update():
+	frappe.db.add_index("File", ["attached_to_doctype", "attached_to_name"])
+	frappe.db.add_index("File", ["file_url(100)"])
+
+
+def has_permission(doc, ptype=None, user=None, debug=False):
+	user = user or frappe.session.user
+
+	if any(frappe.get_hooks("ignore_file_permissions")):
+		return True
+
+	if user == "Administrator":
+		return True
+
+	if not doc.is_private and ptype in ("read", "select"):
+		return True
+
+	if user != "Guest" and doc.owner == user:
+		return True
+	if (
+		user != "Guest"
+		and ptype in ["read", "write", "share", "submit"]
+		and frappe.share.get_shared(
+			"File", filters=[["share_name", "=", doc.name]], rights=[ptype], user=user
+		)
+	):
+		return True
+
+	if doc.attached_to_doctype and doc.attached_to_name:
+		attached_to_doctype = doc.attached_to_doctype
+		attached_to_name = doc.attached_to_name
+
+		try:
+			ref_doc = frappe.get_lazy_doc(attached_to_doctype, attached_to_name)
+		except (ModuleNotFoundError, ImportError):
+			return False
+		except frappe.DoesNotExistError:
+			frappe.clear_last_message()
+			return False
+
+		if ptype in ["write", "create", "delete"]:
+			return ref_doc.has_permission("write", debug=debug, user=user)
+		else:
+			return ref_doc.has_permission("read", debug=debug, user=user)
+
+	return False
+
+
+def get_permission_query_conditions(user: str | None = None) -> str:
+	user = user or frappe.session.user
+
+	if any(frappe.get_hooks("ignore_file_permissions")):
+		return ""
+
+	if user == "Administrator":
+		return ""
+
+	if SYSTEM_USER_ROLE not in frappe.get_roles(user):
+		return f""" `tabFile`.`owner` = {frappe.db.escape(user)} """
+
+	# Custom DocPerm rows can outlive their DocType, drop those
+	# before frappe.get_meta() below assumes the doctype still exists.
+	candidate_doctypes = get_doctypes_with_read(user)
+	existing_doctypes = set(
+		frappe.get_all("DocType", filters={"name": ["in", candidate_doctypes]}, pluck="name")
+	)
+	readable_doctypes = [dt for dt in candidate_doctypes if dt in existing_doctypes]
+
+	openly_readable_doctypes, owner_restricted_doctypes = _split_doctypes_by_owner_constraint(
+		readable_doctypes, user
+	)
+	# a doctype that requires an owner constraint is never additionally scoped by User
+	# Permissions here - same "if_owner takes priority, else check user permissions" rule
+	# used for normal list queries (see database/query.py::get_permission_conditions)
+	openly_readable_doctypes, user_perm_restricted_doctypes = _split_doctypes_by_user_permissions(
+		openly_readable_doctypes, user
+	)
+
+	conditions = [
+		"(`tabFile`.`is_private` = 0)",
+		f"(`tabFile`.`attached_to_doctype` IS NULL AND `tabFile`.`owner` = {frappe.db.escape(user)})",
+	]
+
+	if openly_readable_doctypes:
+		readable_doctypes = ", ".join(repr(dt) for dt in openly_readable_doctypes)
+		conditions.append(f"(`tabFile`.`attached_to_doctype` IN ({readable_doctypes}))")
+
+	# these doctypes only grant "read" to their owner (if_owner), so a File attached to one
+	# of them may only be listed if the requesting user owns the referenced document or it
+	# was individually shared with them.
+	for doctype in owner_restricted_doctypes:
+		table = get_table_name(doctype, wrap_in_backticks=True)
+		conditions.append(
+			_scoped_attachment_condition(doctype, user, f"{table}.`owner` = {frappe.db.escape(user)}")
+		)
+
+	# these doctypes grant unconditional role-level read, but this user is scoped by one or
+	# more User Permissions (e.g. restricted to a specific Company) - only list a file if the
+	# referenced record falls within that scope, or it was individually shared with them
+	for doctype, field_conditions in user_perm_restricted_doctypes.items():
+		conditions.append(_scoped_attachment_condition(doctype, user, " AND ".join(field_conditions)))
+
+	return "(" + " OR ".join(conditions) + ")"
+
+
+def _scoped_attachment_condition(doctype: str, user: str, exists_condition: str) -> str:
+	"""Build `(attached_to_doctype = X AND (EXISTS(...) OR individually shared))`."""
+	table = get_table_name(doctype, wrap_in_backticks=True)
+	shared_names = frappe.share.get_shared(doctype, user)
+	shared_condition = ""
+	if shared_names:
+		shared_list = ", ".join(frappe.db.escape(name, percent=False) for name in shared_names)
+		shared_condition = f" OR `tabFile`.`attached_to_name` IN ({shared_list})"
+
+	return f"""(`tabFile`.`attached_to_doctype` = {frappe.db.escape(doctype)}
+		AND (
+			EXISTS (
+				SELECT 1 FROM {table}
+				WHERE {table}.`name` = `tabFile`.`attached_to_name`
+				AND {exists_condition}
+			){shared_condition}
+		))"""
+
+
+def _split_doctypes_by_owner_constraint(doctypes, user):
+	"""Split doctypes into those the user can read unconditionally vs. only as owner ("if_owner").
+
+	Single doctypes have no per-record table (their fields live in `tabSingles`), so they can't
+	be scoped with a `SELECT ... FROM tab<Doctype>` check and are always treated as openly readable.
+	"""
+	openly_readable, owner_restricted = [], []
+	for doctype in doctypes:
+		if frappe.get_meta(doctype).issingle:
+			openly_readable.append(doctype)
+			continue
+		role_permissions = get_role_permissions(doctype, user=user)
+		if requires_owner_constraint(role_permissions):
+			owner_restricted.append(doctype)
+		else:
+			openly_readable.append(doctype)
+	return openly_readable, owner_restricted
+
+
+def _split_doctypes_by_user_permissions(doctypes, user):
+	"""Split doctypes into those unaffected by User Permissions vs. those scoped by them.
+
+	Mirrors the simplified, non-recursive semantics list queries already use for their own
+	doctype (db_query.py::add_user_permissions / database/query.py::get_user_permission_conditions)
+	- not the full has_user_permission() used for single-document checks, which additionally
+	does tree traversal and isn't expressible as a flat SQL condition.
+	"""
+	user_permissions = frappe.permissions.get_user_permissions(user)
+	if not user_permissions:
+		return doctypes, {}
+
+	strict_user_permissions = frappe.get_system_settings("apply_strict_user_permissions")
+
+	unrestricted, restricted = [], {}
+	for doctype in doctypes:
+		if frappe.get_meta(doctype).issingle:
+			unrestricted.append(doctype)
+			continue
+		field_conditions = _get_user_permission_field_conditions(
+			doctype, user_permissions, strict_user_permissions
+		)
+		if field_conditions:
+			restricted[doctype] = field_conditions
+		else:
+			unrestricted.append(doctype)
+	return unrestricted, restricted
+
+
+def _get_user_permission_field_conditions(doctype, user_permissions, strict_user_permissions) -> list[str]:
+	"""SQL conditions (to be AND'd) restricting `doctype` rows to those permitted by `user_permissions`."""
+	link_fields = [{"options": doctype, "fieldname": "name"}, *frappe.get_meta(doctype).get_link_fields()]
+	table = get_table_name(doctype, wrap_in_backticks=True)
+
+	conditions = []
+	for df in link_fields:
+		if df.get("ignore_user_permissions"):
+			continue
+
+		permitted = user_permissions.get(df.get("options"))
+		if not permitted:
+			continue
+
+		docs = [
+			p.get("doc")
+			for p in permitted
+			if not p.get("applicable_for") or p.get("applicable_for") == doctype
+		]
+		if not docs:
+			continue
+
+		field = f"{table}.`{df.get('fieldname')}`"
+		docs_list = ", ".join(frappe.db.escape(doc, percent=False) for doc in docs)
+		if strict_user_permissions:
+			conditions.append(f"{field} IN ({docs_list})")
+		else:
+			conditions.append(f"(ifnull({field}, '') = '' OR {field} IN ({docs_list}))")
+
+	return conditions
+
+
+# Note: kept at the end to not cause circular, partial imports & maintain backwards compatibility
+from frappe.core.api.file import *

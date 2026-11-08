@@ -1,21 +1,17 @@
 # ERPNext Bench
 
-A development bench for ERPNext on the Frappe Framework. The Frappe and ERPNext source trees are tracked as Git submodules at the commits used by this bench. See [MODULES.md](MODULES.md) for a module map and [docs/erpnext-modules](docs/erpnext-modules/README.md) for detailed diagrams.
+A development bench for ERPNext on the Frappe Framework. The Frappe and ERPNext source trees are included directly in this repository, so both can be customized and committed here without initializing submodules. See [MODULES.md](MODULES.md) for a module map and [docs/erpnext-modules](docs/erpnext-modules/README.md) for detailed diagrams.
 
 ## Clone
 
-Clone this repository with its submodules:
+Clone this repository:
 
 ```bash
-git clone --recurse-submodules https://github.com/vantoan2905/ERA_ERP.git
+git clone https://github.com/vantoan2905/ERA_ERP.git
 cd ERA_ERP
 ```
 
-If you already cloned the repository without submodules, initialize them with:
-
-```bash
-git submodule update --init --recursive
-```
+The `apps/frappe` and `apps/erpnext` directories are versioned as regular project directories in this repository. Edit either app directly and commit your customizations to this repository.
 
 ## Requirements and setup
 
@@ -26,8 +22,8 @@ Install the system dependencies and compatible versions of Python, Node.js, Redi
 ```text
 ERA_ERP/
 ├── apps/
-│   ├── frappe/                  # Frappe Framework submodule
-│   └── erpnext/                 # ERPNext submodule
+│   ├── frappe/                  # Frappe Framework source
+│   └── erpnext/                 # ERPNext source
 ├── docs/erpnext-modules/        # Detailed module diagrams
 ├── tools/erpnext_seed/          # Demo and performance data generator
 ├── MODULES.md                   # Module overview

@@ -1,9 +1,10 @@
 # Python environments and caches
-env/
+/env/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+node_modules/
 .env
 .env.*
 *.log
@@ -11,19 +12,14 @@ __pycache__/
 *.sock
 
 # Local site data, credentials, uploads and generated assets
-sites/*/
-!sites/apps.txt
-!sites/apps.json
-sites/common_site_config.json
-sites/assets/
+/sites/*/
+/sites/common_site_config.json
+/sites/assets/
 
 # Runtime state and logs
-logs/
-config/
-config/pids/
-config/*.lock
-config/scheduler_process
-flow-server/
+/logs/
+/config/
+/flow-server/
 
 # Local/editor/OS files
 .DS_Store

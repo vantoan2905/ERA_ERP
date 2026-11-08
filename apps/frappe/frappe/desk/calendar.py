@@ -1,0 +1,76 @@
+# Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
+# License: MIT. See LICENSE
+
+from datetime import date
+
+import frappe
+from frappe import _
+from frappe.query_builder import functions
+from frappe.utils import get_datetime, getdate
+
+
+@frappe.whitelist()
+def update_event(args: str | dict, field_map: str | dict):
+	"""Updates Event (called via calendar) based on passed `field_map`"""
+	args = frappe._dict(frappe.parse_json(args))
+	field_map = frappe._dict(frappe.parse_json(field_map))
+	w = frappe.get_doc(args.doctype, args.name)
+	w.set(field_map.start, args[field_map.start])
+	w.set(field_map.end, args.get(field_map.end))
+	w.save()
+
+
+def get_event_conditions(doctype, filters=None):
+	"""Return SQL conditions with user permissions and filters for event queries."""
+	from frappe.desk.reportview import get_filters_cond
+
+	if not frappe.has_permission(doctype):
+		frappe.throw(_("Not Permitted"), frappe.PermissionError)
+
+	return get_filters_cond(doctype, filters, [], with_match_conditions=True)
+
+
+@frappe.whitelist()
+def get_events(
+	doctype: str,
+	start: str | date,
+	end: str | date,
+	field_map: str | dict,
+	filters: str | list | dict | None = None,
+	fields: str | list[str] | None = None,
+	order_by: str | None = None,
+):
+	start, end = getdate(start), get_datetime(end)
+
+	field_map = frappe._dict(frappe.parse_json(field_map))
+	fields = frappe.parse_json(fields)
+
+	doc_meta = frappe.get_meta(doctype)
+	for d in doc_meta.fields:
+		if d.fieldtype == "Color":
+			field_map.update({"color": d.fieldname})
+
+	filters = frappe.parse_json(filters) or []
+
+	if not fields:
+		fields = [field_map.start, field_map.end, field_map.title, "name"]
+
+	if field_map.color:
+		fields.append(field_map.color)
+
+	valid_columns = doc_meta.get_valid_columns()
+	for key in ("start", "end"):
+		if field_map.get(key) not in valid_columns:
+			frappe.throw(_("{0} is not a valid field of {1}").format(field_map.get(key), doctype))
+
+	dt = frappe.qb.DocType(doctype)
+	start_field = functions.IfNull(dt[field_map.start], dt[field_map.end])
+	end_field = functions.IfNull(dt[field_map.end], dt[field_map.start])
+
+	filters += [
+		[start_field, "<=", end],
+		[end_field, ">=", start],
+	]
+
+	fields = list({field for field in fields if field})
+	return frappe.get_list(doctype, fields=fields, filters=filters, order_by=order_by)
