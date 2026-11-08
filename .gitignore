@@ -1,0 +1,31 @@
+# Python environments and caches
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.env
+.env.*
+*.log
+*.pid
+*.sock
+
+# Local site data, credentials, uploads and generated assets
+sites/*/
+!sites/apps.txt
+!sites/apps.json
+sites/common_site_config.json
+sites/assets/
+
+# Runtime state and logs
+logs/
+config/
+config/pids/
+config/*.lock
+config/scheduler_process
+flow-server/
+
+# Local/editor/OS files
+.DS_Store
+.idea/
+.vscode/
