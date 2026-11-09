@@ -1,0 +1,6 @@
+app_name = "era_vision"
+app_title = "ERA Vision"
+app_publisher = "ERA Vision"
+app_description = "Computer vision workflows for Frappe"
+app_email = ""
+app_license = "MIT"
